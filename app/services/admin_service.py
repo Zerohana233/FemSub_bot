@@ -20,8 +20,10 @@ class AdminService:
         self.container = container
         self.db = container.db
         self.settings = container.settings
+        # 管理员三种临时状态：编辑文案 / 添加标签 / 填写拒绝理由
         self.edit_states: TimedStateStore[Dict] = TimedStateStore(ttl_seconds=600)
         self.tag_states: TimedStateStore[Dict] = TimedStateStore(ttl_seconds=600)
+        self.reject_states: TimedStateStore[Dict] = TimedStateStore(ttl_seconds=600)
 
     def create_review_keyboard(self, submission: Submission) -> InlineKeyboardMarkup:
         keyboard = [
@@ -193,30 +195,40 @@ class AdminService:
             )
 
     async def _handle_admin_reject_simple(self, query, submission_id: str, context: ContextTypes.DEFAULT_TYPE):
+        """管理员点“拒绝”后，提示其回复理由，再转发给用户。"""
         submission = self.db.get_submission(submission_id)
 
         if not submission:
             await query.edit_message_text("❌ 投稿不存在", parse_mode=ParseMode.HTML)
             return
 
-        try:
-            await context.bot.send_message(
-                chat_id=submission.user_id,
-                text="🚫 抱歉，您的投稿未通过审核。",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.error("Error notifying user about rejection: %s", exc)
+        escaped_caption = html.escape(submission.caption_only or "（无文案）")
+        prompt_text = (
+            f"🚫 <b>准备拒绝此条投稿</b>\n\n"
+            f"{escaped_caption}\n\n"
+            "请<b>直接回复本条消息</b>，输入你想让她看到的理由 / 辱骂 / 评语。\n"
+            "如果你只回一个表情或空消息，就会发一条默认的拒绝提示给她。"
+        )
 
-        submission.status = SubmissionStatus.REJECTED
-        self.db.save_submission(submission)
+        prompt_message = await context.bot.send_message(
+            chat_id=self.settings.admin_group_id,
+            text=prompt_text,
+            parse_mode=ParseMode.HTML,
+        )
 
-        admin_name = query.from_user.first_name
-        if query.from_user.last_name:
-            admin_name += f" {query.from_user.last_name}"
+        admin_id = query.from_user.id
+        self.reject_states.set(
+            admin_id,
+            {
+                "sub_id": submission_id,
+                "prompt_msg_id": prompt_message.message_id,
+                "control_msg_id": query.message.message_id,
+            },
+        )
 
+        # 控制面板先标记为“待填写拒绝理由”
         await query.edit_message_text(
-            f"🚫 <b>已拒绝</b> (操作人: {admin_name})",
+            "🚫 <b>待填写拒绝理由…</b>\n请在群里回复机器人刚发的提示消息。",
             reply_markup=None,
             parse_mode=ParseMode.HTML,
         )
@@ -340,6 +352,8 @@ class AdminService:
             await self._process_edit_reply(admin_id, message, context)
         elif admin_id in self.tag_states:
             await self._process_tag_reply(admin_id, message, context)
+        elif admin_id in self.reject_states:
+            await self._process_reject_reply(admin_id, message, context)
 
     async def _process_edit_reply(self, admin_id: int, message, context: ContextTypes.DEFAULT_TYPE):
         state_data = self.edit_states.get(admin_id)
@@ -416,6 +430,71 @@ class AdminService:
         await self._safe_delete_message(message.message_id, context)
         await self._safe_delete_message(prompt_msg_id, context)
         self.tag_states.delete(admin_id)
+
+    async def _process_reject_reply(self, admin_id: int, message, context: ContextTypes.DEFAULT_TYPE):
+        state_data = self.reject_states.get(admin_id)
+        if not state_data:
+            return
+
+        submission_id = state_data["sub_id"]
+        prompt_msg_id = state_data["prompt_msg_id"]
+        control_msg_id = state_data["control_msg_id"]
+
+        submission = self.db.get_submission(submission_id)
+        if not submission:
+            await self._safe_delete_message(prompt_msg_id, context)
+            self.reject_states.delete(admin_id)
+            return
+
+        # 管理员写的理由（如果是 None 或空，就用默认文本）
+        admin_reason = (message.text or "").strip()
+        if admin_reason:
+            safe_reason = html.escape(admin_reason)
+            user_text = (
+                "🚫 <b>投稿未通过</b>\n\n"
+                f"拒绝原因：\n{safe_reason}"
+            )
+        else:
+            user_text = (
+                "🚫 <b>投稿未通过</b>\n\n"
+                "可能是画质、内容风格或当天竞争太多的原因。\n"
+                "如果你还想当下贱的玩物，可以随时再来。"
+            )
+
+        try:
+            await context.bot.send_message(
+                chat_id=submission.user_id,
+                text=user_text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error("Error notifying user about rejection: %s", exc)
+
+        # 更新数据库状态
+        submission.status = SubmissionStatus.REJECTED
+        self.db.save_submission(submission)
+
+        # 更新管理员控制面板那条消息
+        try:
+            admin_name = message.from_user.first_name
+            if message.from_user.last_name:
+                admin_name += f" {message.from_user.last_name}"
+
+            summary = f"理由：{admin_reason[:30]}..." if admin_reason else "使用默认理由"
+            await context.bot.edit_message_text(
+                chat_id=self.settings.admin_group_id,
+                message_id=control_msg_id,
+                text=f"🚫 <b>已拒绝</b> (操作人: {admin_name})\n{summary}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.error("Error updating admin control message after rejection: %s", exc)
+
+        # 清理提示消息和管理员自己的回复
+        await self._safe_delete_message(message.message_id, context)
+        await self._safe_delete_message(prompt_msg_id, context)
+
+        self.reject_states.delete(admin_id)
 
     async def _update_preview_message(self, submission: Submission, context: ContextTypes.DEFAULT_TYPE):
         try:
