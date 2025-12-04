@@ -43,7 +43,10 @@ class FeedbackService:
         )
 
     async def handle_admin_reply_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.message
+        # 可能是普通消息 / 编辑消息等，这里统一用 effective_message 获取
+        message = update.effective_message
+        if message is None:
+            return
         admin_id = message.from_user.id
 
         if admin_id not in self.admin_reply_states:
