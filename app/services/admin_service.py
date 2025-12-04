@@ -108,11 +108,13 @@ class AdminService:
             if self.settings.nav_channel_link:
                 nav_link = f"<a href='{self.settings.nav_channel_link}'>𝔽𝕖𝕞𝕊𝕦𝕓</a>"
                 footer_text += f"\n{nav_link}"
+            footer_text += f"\n<a href='https://t.me/FemSub_bot'>点我投稿</a>"
             final_caption += footer_text
         else:
             if self.settings.nav_channel_link:
                 nav_link = f"<a href='{self.settings.nav_channel_link}'>𝔽𝕖𝕞𝕊𝕦𝕓</a>"
                 final_caption += f"\n\n{nav_link}"
+            final_caption += f"\n<a href='https://t.me/FemSub_bot'>点我投稿</a>"
 
         try:
             if len(submission.media_files) > 1:
