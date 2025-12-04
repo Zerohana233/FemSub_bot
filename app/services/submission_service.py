@@ -30,7 +30,10 @@ class SubmissionService:
         self.media_group_tasks: Dict[str, asyncio.Task] = {}
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        message = update.message
+        # 只处理真正的消息更新，忽略回调 / 其它类型
+        message = update.effective_message
+        if message is None:
+            return
 
         if message.media_group_id:
             await self._handle_media_group_message(update, context)
